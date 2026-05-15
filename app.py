@@ -1,5 +1,5 @@
 """
-한국어 발화 분석기 v12 (Streamlit 버전)
+한국어 발화 분석기 v13 (Streamlit 버전)
 ======================================
 언어치료 및 발화 분석 연구를 위한 도구.
 
@@ -20,6 +20,7 @@
 
 import io
 import datetime
+from collections import Counter
 import pandas as pd
 import streamlit as st
 from kiwipiepy import Kiwi
@@ -159,13 +160,13 @@ def split_utterances(text):
 # ──────────────────────────────────────────────────────
 # 핵심 분석 함수
 # ──────────────────────────────────────────────────────
-def run_analysis(text_content, analyze_affixes=True):
+def run_analysis(text_content, analyze_affixes=False):
     """발화 분석 메인 함수.
 
     Args:
         text_content (str): 분석할 텍스트
-        analyze_affixes (bool): True면 파생접사를 별개 형태소로 분석 (기본값).
-                                False면 접사를 어근에 결합해 단일 토큰으로 처리.
+        analyze_affixes (bool): False면 파생접사를 어근에 결합해 단일 토큰으로 처리 (기본값).
+                                True면 파생접사를 별개 형태소로 분석.
 
     Returns:
         (DataFrame, dict) 또는 (None, None) - 발화가 없을 때
@@ -177,6 +178,7 @@ def run_analysis(text_content, analyze_affixes=True):
     results = []
     all_tokens_sf = []   # 전체 형태소 표면형 (문장부호 제외)
     all_cont_forms = []  # 내용어 형태소 표면형
+    all_cont_pairs = []  # 내용어 (표면형, 품사) 페어 — NDW 단어 리스트용
 
     for i, utt in enumerate(utterances):
         tokens = kiwi.tokenize(utt)
@@ -198,9 +200,11 @@ def run_analysis(text_content, analyze_affixes=True):
         # 표면형
         sf_all = [t.form for t in morph_tokens]
         cont_forms = [t.form for t in cont_tok]
+        cont_pairs = [(t.form, base_tag(t.tag)) for t in cont_tok]
 
         all_tokens_sf.extend(sf_all)
         all_cont_forms.extend(cont_forms)
+        all_cont_pairs.extend(cont_pairs)
 
         morph_str = " ".join(f"{t.form}/{t.tag}" for t in morph_tokens)
 
@@ -223,8 +227,20 @@ def run_analysis(text_content, analyze_affixes=True):
     type_n  = len(set(all_tokens_sf))
     cont_n  = len(all_cont_forms)
     func_n  = token_n - cont_n
-    ndw     = len(set(all_cont_forms))
-    ndw_50  = len(set(all_cont_forms[:50]))
+    ndw     = len(set(all_cont_forms))                # NDW: 표면형 기준 (기존 호환)
+    ndw_50  = len(set(all_cont_forms[:50]))           # NDW-50: 첫 50 내용어 토큰 기준
+
+    # NDW 단어 리스트 (표면형, 품사) 페어 기준 + 빈도
+    # 전체 NDW 어휘
+    ndw_counter = Counter(all_cont_pairs)
+    ndw_words_df = pd.DataFrame(
+        [{"단어": f, "품사": t, "빈도": c} for (f, t), c in ndw_counter.most_common()]
+    )
+    # NDW-50 어휘 (첫 50개 내용어 토큰에서 추출)
+    ndw50_counter = Counter(all_cont_pairs[:50])
+    ndw50_words_df = pd.DataFrame(
+        [{"단어": f, "품사": t, "빈도": c} for (f, t), c in ndw50_counter.most_common()]
+    )
 
     summary = {
         '발화수':       n_utt,
@@ -240,6 +256,8 @@ def run_analysis(text_content, analyze_affixes=True):
         '내용어수':      cont_n,
         '기능어수':      func_n,
         '_접사분석':     analyze_affixes,
+        '_NDW_words':    ndw_words_df,    # 전체 NDW 단어 리스트 (단어/품사/빈도)
+        '_NDW50_words':  ndw50_words_df,  # NDW-50 단어 리스트
     }
     return df, summary
 
@@ -248,7 +266,7 @@ def run_analysis(text_content, analyze_affixes=True):
 # Excel 다운로드용 바이트 생성
 # ──────────────────────────────────────────────────────
 def build_excel_bytes(df, summary):
-    """발화별 상세 + 요약 통계 두 시트로 구성된 Excel 바이트를 반환."""
+    """발화별 상세 + 요약 통계 + NDW 어휘 시트로 구성된 Excel 바이트를 반환."""
     summary_df = pd.DataFrame([
         {"지표": "발화수",     "값": summary["발화수"],    "설명": "총 발화 수"},
         {"지표": "Token",      "값": summary["Token"],     "설명": "총 형태소 수 (문장부호 제외)"},
@@ -266,10 +284,17 @@ def build_excel_bytes(df, summary):
                               "설명": "파생접사(XSV·XSA·XSN·XSM·XPN)를 별개 형태소로 분석할지 여부"},
     ])
 
+    ndw_words_df   = summary.get('_NDW_words',   pd.DataFrame())
+    ndw50_words_df = summary.get('_NDW50_words', pd.DataFrame())
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="발화별 상세", index=False)
         summary_df.to_excel(writer, sheet_name="요약 통계", index=False)
+        if not ndw_words_df.empty:
+            ndw_words_df.to_excel(writer, sheet_name="NDW 어휘", index=False)
+        if not ndw50_words_df.empty:
+            ndw50_words_df.to_excel(writer, sheet_name="NDW-50 어휘", index=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -291,16 +316,16 @@ with st.sidebar:
     st.header("⚙️ 분석 옵션")
     analyze_affixes = st.checkbox(
         "파생접사 분석 (ON/OFF)",
-        value=True,
+        value=False,
         help=(
-            "**ON**: 파생접사(XSV·XSA·XSN·XSM·XPN)를 별개 형태소로 분석 (기본값)\n\n"
-            "**OFF**: 접사를 어근에 결합 (예: 공부+하/XSV → 공부하/VV)"
+            "**ON**: 파생접사(XSV·XSA·XSN·XSM·XPN)를 별개 형태소로 분석\n\n"
+            "**OFF**: 접사를 어근에 결합 (예: 공부+하/XSV → 공부하/VV) — 기본값"
         ),
     )
     st.caption(
         "예: '공부하다'\n"
-        "- ON  → 공부/NNG · 하/XSV · 다/EF (3형태소)\n"
-        "- OFF → 공부하/VV · 다/EF (2형태소)"
+        "- OFF → 공부하/VV · 다/EF (2형태소) — 기본값\n"
+        "- ON  → 공부/NNG · 하/XSV · 다/EF (3형태소)"
     )
 
     st.divider()
@@ -377,18 +402,16 @@ if text_content is not None and text_content.strip():
         st.warning("분석할 발화가 없습니다. 텍스트를 확인해 주세요.")
     else:
         # 결과 헤더 + 옵션 상태 배지
-        affix_on = summary.get('_접사분석', True)
-        affix_label = "접사분석 ON" if affix_on else "접사결합 (접사분석 OFF)"
+        affix_on = summary.get('_접사분석', False)
+        affix_label = "접사분석 ON" if affix_on else "접사분석 OFF (접사 결합)"
 
         st.divider()
         col_title, col_badge = st.columns([4, 1])
         with col_title:
             st.subheader(f"📊 {source_title}")
         with col_badge:
-            if affix_on:
-                st.success(affix_label)
-            else:
-                st.warning(affix_label)
+            # 두 상태 모두 정보 표시(info)로 — OFF가 기본값이므로 경고 색은 부적절
+            st.info(affix_label)
 
         # ── 요약 통계: st.metric 그리드 ─────────────────
         st.markdown("##### ▸ 발화 / 형태소 기반")
@@ -409,20 +432,68 @@ if text_content is not None and text_content.strip():
         n5.metric("내용어수",  summary['내용어수'])
         n6.metric("기능어수",  summary['기능어수'])
 
-        # ── 발화별 상세 테이블 ─────────────────────────
-        st.markdown("##### 📋 발화별 상세 지표")
-        display_cols = ["No", "발화", "어절수", "단어수", "형태소수",
-                        "내용어수", "기능어수", "형태소분석"]
-        st.dataframe(
-            df[display_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "No":         st.column_config.NumberColumn(width="small"),
-                "발화":       st.column_config.TextColumn(width="medium"),
-                "형태소분석": st.column_config.TextColumn(width="large"),
-            },
-        )
+        # ── 결과 탭: 발화별 상세 / NDW 어휘 / NDW-50 어휘 ──
+        ndw_words_df   = summary['_NDW_words']
+        ndw50_words_df = summary['_NDW50_words']
+
+        tab_detail, tab_ndw, tab_ndw50 = st.tabs([
+            "📋 발화별 상세 지표",
+            f"📚 NDW 어휘 ({summary['NDW']}개)",
+            f"📚 NDW-50 어휘 ({summary['NDW_50']}개)",
+        ])
+
+        with tab_detail:
+            display_cols = ["No", "발화", "어절수", "단어수", "형태소수",
+                            "내용어수", "기능어수", "형태소분석"]
+            st.dataframe(
+                df[display_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "No":         st.column_config.NumberColumn(width="small"),
+                    "발화":       st.column_config.TextColumn(width="medium"),
+                    "형태소분석": st.column_config.TextColumn(width="large"),
+                },
+            )
+
+        with tab_ndw:
+            st.caption(
+                f"전체 발화에 사용된 서로 다른 내용어 {summary['NDW']}개 "
+                f"(내용어 토큰 총 {summary['내용어수']}개 중). "
+                "같은 표면형이라도 품사가 다르면 별개 단어로 카운트됩니다."
+            )
+            if ndw_words_df.empty:
+                st.info("내용어가 추출되지 않았습니다.")
+            else:
+                st.dataframe(
+                    ndw_words_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "단어": st.column_config.TextColumn(width="medium"),
+                        "품사": st.column_config.TextColumn(width="small"),
+                        "빈도": st.column_config.NumberColumn(width="small"),
+                    },
+                )
+
+        with tab_ndw50:
+            st.caption(
+                f"첫 50개 내용어 토큰에서 추출된 서로 다른 단어 {summary['NDW_50']}개. "
+                "표본 크기를 50으로 통제한 NDW로, 발화량 차이에 따른 편향을 줄이는 데 쓰입니다."
+            )
+            if ndw50_words_df.empty:
+                st.info("내용어가 50개 미만이거나 추출되지 않았습니다.")
+            else:
+                st.dataframe(
+                    ndw50_words_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "단어": st.column_config.TextColumn(width="medium"),
+                        "품사": st.column_config.TextColumn(width="small"),
+                        "빈도": st.column_config.NumberColumn(width="small"),
+                    },
+                )
 
         # ── Excel 다운로드 ─────────────────────────────
         src_label = '직접입력' if '직접' in source_title else (
@@ -435,7 +506,7 @@ if text_content is not None and text_content.strip():
 
         excel_bytes = build_excel_bytes(df, summary)
         st.download_button(
-            label="⬇️ Excel 저장 (발화별 상세 + 요약 통계)",
+            label="⬇️ Excel 저장 (발화별 상세 + 요약 통계 + NDW 어휘)",
             data=excel_bytes,
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
